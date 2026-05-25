@@ -1,9 +1,12 @@
-"""Extract unresolved comments from unpacked docx XML.
+"""Extract unresolved comments from a .docx file or unpacked docx directory.
 
-Usage: python scripts/extract_docx_comments.py <unpacked_dir> [-o output.md]
+Usage:
+  python extract_docx_comments.py manuscript.docx [-o comments.md]
+  python extract_docx_comments.py <unpacked_dir> [-o comments.md]
 """
 import argparse
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 NS = {
@@ -21,10 +24,27 @@ def get_all_text(elem):
     return ''.join(texts)
 
 
-def extract(base: Path, output: Path):
+def _open_xml(source: Path, rel_path: str) -> ET.Element | None:
+    """Parse an XML member. Returns None if the file does not exist."""
+    if source.suffix.lower() == '.docx':
+        with zipfile.ZipFile(source) as z:
+            if rel_path not in z.namelist():
+                return None
+            return ET.fromstring(z.read(rel_path))
+    p = source / rel_path
+    return ET.parse(p).getroot() if p.exists() else None
+
+
+def extract(source: Path, output: Path) -> bool:
+    """Extract comments. Returns True if comments were written, False otherwise."""
+    label = source.stem
     # --- 1. Parse comments.xml ---
     comments = {}
-    for c in ET.parse(base / 'word/comments.xml').findall('.//w:comment', NS):
+    comments_root = _open_xml(source, 'word/comments.xml')
+    if comments_root is None:
+        print('No comments found, skipping.')
+        return False
+    for c in comments_root.findall('.//w:comment', NS):
         cid = c.get(f'{{{NS["w"]}}}id')
         texts = []
         for t in c.iter(f'{{{NS["w"]}}}t'):
@@ -44,7 +64,8 @@ def extract(base: Path, output: Path):
 
     # --- 2. Parse commentsExtended.xml for resolved status ---
     done_map, parent_map = {}, {}
-    for ex in ET.parse(base / 'word/commentsExtended.xml').findall('.//w15:commentEx', NS):
+    ext_root = _open_xml(source, 'word/commentsExtended.xml')
+    for ex in (ext_root.findall('.//w15:commentEx', NS) if ext_root is not None else []):
         pid = ex.get(f'{{{NS["w15"]}}}paraId')
         done_map[pid] = ex.get(f'{{{NS["w15"]}}}done') == '1'
         ppid = ex.get(f'{{{NS["w15"]}}}paraIdParent')
@@ -65,7 +86,9 @@ def extract(base: Path, output: Path):
                         break
 
     # --- 3. Parse document.xml for annotated text and section context ---
-    doc_root = ET.parse(base / 'word/document.xml').getroot()
+    doc_root = _open_xml(source, 'word/document.xml')
+    if doc_root is None:
+        raise FileNotFoundError(f'word/document.xml not found in {source}')
     body = doc_root.find(f'{{{NS["w"]}}}body')
     all_paras = list(body.iter(f'{{{NS["w"]}}}p'))
 
@@ -121,7 +144,7 @@ def extract(base: Path, output: Path):
         if cid in comment_parent and comment_parent[cid] in replies:
             replies[comment_parent[cid]].append(cid)
 
-    lines = [f'# Unresolved comments — {base.name}\n']
+    lines = [f'# Unresolved comments - {label}\n']
     for cid in top_level:
         info = comments[cid]
         section = section_map.get(cid, '')
@@ -140,15 +163,20 @@ def extract(base: Path, output: Path):
             lines.append(f'  - **Reply** ({ri["author"]}, {ri["date"]}): {ri["text"]}\n')
         lines.append('')
 
+    if not top_level:
+        print('All comments resolved, skipping.')
+        return False
+
     output.write_text('\n'.join(lines), encoding='utf-8')
     n_resolved = sum(1 for v in resolved.values() if v)
-    print(f'Total: {len(comments)}, resolved: {n_resolved}, unresolved output: {len(top_level)} top-level + {sum(len(v) for v in replies.values())} replies')
+    print(f'Total: {len(comments)}, resolved: {n_resolved}, unresolved: {len(top_level)} + {sum(len(v) for v in replies.values())} replies')
+    return True
 
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('unpacked_dir', type=Path)
+    ap.add_argument('source', type=Path, help='.docx file or unpacked docx directory')
     ap.add_argument('-o', '--output', type=Path, default=None)
     args = ap.parse_args()
-    out = args.output or (args.unpacked_dir.parent / 'comments.md')
-    extract(args.unpacked_dir, out)
+    out = args.output or args.source.with_suffix('').with_name(args.source.stem + '_comment.md')
+    extract(args.source, out)
