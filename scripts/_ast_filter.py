@@ -353,7 +353,87 @@ def filter_ast(ast: dict) -> dict:
     return ast
 
 
-def _postclean(md_path: Path) -> None:
+# Greek char → LaTeX command name (for \mathbf{\cmd} matching in _postclean)
+_GREEK_LATEX = {
+    'Α': 'Alpha', 'Β': 'Beta', 'Γ': 'Gamma', 'Δ': 'Delta',
+    'Ε': 'Epsilon', 'Ζ': 'Zeta', 'Η': 'Eta', 'Θ': 'Theta',
+    'Ι': 'Iota', 'Κ': 'Kappa', 'Λ': 'Lambda', 'Μ': 'Mu',
+    'Ν': 'Nu', 'Ξ': 'Xi', 'Ο': 'Omicron', 'Π': 'Pi',
+    'Ρ': 'Rho', 'Σ': 'Sigma', 'Τ': 'Tau', 'Υ': 'Upsilon',
+    'Φ': 'Phi', 'Χ': 'Chi', 'Ψ': 'Psi', 'Ω': 'Omega',
+    'α': 'alpha', 'β': 'beta', 'γ': 'gamma', 'δ': 'delta',
+    'ε': 'varepsilon', 'ζ': 'zeta', 'η': 'eta', 'θ': 'theta',
+    'ι': 'iota', 'κ': 'kappa', 'λ': 'lambda', 'μ': 'mu',
+    'ν': 'nu', 'ξ': 'xi', 'π': 'pi',
+    'ρ': 'rho', 'σ': 'sigma', 'τ': 'tau', 'υ': 'upsilon',
+    'φ': 'phi', 'χ': 'chi', 'ψ': 'psi', 'ω': 'omega',
+    'ϕ': 'phi', 'ϑ': 'vartheta', 'ϵ': 'epsilon',
+    'ϰ': 'varkappa', 'ϱ': 'varrho', 'ϖ': 'varpi',
+    '∇': 'nabla', '∂': 'partial',
+}
+
+
+# Standard LaTeX operators that pandoc already wraps in \operatorname{}.
+_PANDOC_OPERATORS = {
+    'sin', 'cos', 'tan', 'cot', 'sec', 'csc',
+    'arcsin', 'arccos', 'arctan',
+    'sinh', 'cosh', 'tanh', 'coth',
+    'log', 'ln', 'exp', 'lim', 'sup', 'inf',
+    'min', 'max', 'arg', 'det', 'dim', 'deg',
+    'gcd', 'hom', 'ker', 'mod', 'Pr',
+}
+
+
+def _scan_docx_math(docx_path: Path) -> tuple[set, set]:
+    """Single-pass scan of DOCX math runs.
+
+    Returns (bi_chars, operator_names):
+      - bi_chars: chars that appear exclusively with m:sty val="bi" (never "b")
+      - operator_names: multi-letter text with m:sty val="p" but NO m:nor
+        (m:nor = text label → pandoc wraps in \\text{}, not our concern)
+    """
+    import zipfile
+    from lxml import etree
+
+    M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+    bi_chars, b_chars, op_names = set(), set(), set()
+
+    try:
+        with zipfile.ZipFile(docx_path, 'r') as zin:
+            doc_xml = zin.read('word/document.xml')
+    except (KeyError, Exception):
+        return set(), set()
+
+    tree = etree.fromstring(doc_xml)
+    for mr in tree.iter(f'{{{M}}}r'):
+        mrPr = mr.find(f'{{{M}}}rPr')
+        if mrPr is None:
+            continue
+        mt = mr.find(f'{{{M}}}t')
+        if mt is None or not mt.text:
+            continue
+        sty = mrPr.find(f'{{{M}}}sty')
+        nor = mrPr.find(f'{{{M}}}nor')
+        val = sty.get(f'{{{M}}}val', '') if sty is not None else ''
+
+        # Collect bold / bold-italic chars
+        if val == 'bi':
+            bi_chars.update(mt.text)
+        elif val == 'b':
+            b_chars.update(mt.text)
+
+        # Operator names: m:sty val="p" WITHOUT m:nor
+        if val == 'p' and nor is None:
+            text = mt.text.strip()
+            if (len(text) >= 2 and text[0].isalpha()
+                    and text.isalnum() and text not in _PANDOC_OPERATORS):
+                op_names.add(text)
+
+    return bi_chars - b_chars, op_names
+
+
+def _postclean(md_path: Path, bi_chars: set = None,
+               operator_names: set = None) -> None:
     """Clean up pandoc Markdown artifacts in prose, preserving math blocks."""
     text = md_path.read_text(encoding="utf-8")
 
@@ -384,6 +464,27 @@ def _postclean(md_path: Path) -> None:
                 r"\\overset\{\\hat\{\}\}\{((?:[^{}]|\{[^{}]*\})*)\}",
                 r"\\widehat{\1}", seg
             )
+            # \mathbf{X} → \boldsymbol{X} for chars that had bi style in DOCX
+            if bi_chars:
+                for ch in bi_chars:
+                    seg = seg.replace(f'\\mathbf{{{ch}}}', f'\\boldsymbol{{{ch}}}')
+                    seg = seg.replace(f'{{\\mathbf{{{ch}}}}}', f'\\boldsymbol{{{ch}}}')
+                    # Greek: also match LaTeX command form \mathbf{\phi} etc.
+                    latex_name = _GREEK_LATEX.get(ch)
+                    if latex_name:
+                        seg = seg.replace(
+                            f'\\mathbf{{\\{latex_name}}}',
+                            f'\\boldsymbol{{\\{latex_name}}}'
+                        )
+            # Bare operator names that pandoc doesn't wrap → \operatorname{}
+            if operator_names:
+                pat = '|'.join(re.escape(n) for n in
+                               sorted(operator_names, key=len, reverse=True))
+                # (?<![a-zA-Z{]) prevents matching inside \text{}, \mathrm{}
+                seg = re.sub(
+                    rf'(?<![a-zA-Z{{])({pat})(?![a-zA-Z{{}}])',
+                    r'\\operatorname{\1}', seg
+                )
             cleaned.append(seg)
         else:
             seg = seg.replace("\\'", "'")   # coefficient\'s → coefficient's
@@ -402,6 +503,9 @@ def convert(docx_path: str | Path, md_path: str | Path) -> None:
 
     docx_path = Path(docx_path)
     md_path = Path(md_path)
+
+    # Single-pass scan of DOCX math: bold-italic chars + operator names
+    bi_chars, operator_names = _scan_docx_math(docx_path)
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         tmp_json = tmp.name
@@ -440,7 +544,8 @@ def convert(docx_path: str | Path, md_path: str | Path) -> None:
         )
 
         # Step 4: clean up pandoc escape artifacts in prose
-        _postclean(md_path)
+        _postclean(md_path, bi_chars=bi_chars,
+                   operator_names=operator_names)
 
     finally:
         os.unlink(tmp_json)
