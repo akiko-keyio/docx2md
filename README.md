@@ -10,7 +10,6 @@
 
 ## Note
 
-- 依赖 **pandoc**（需在 PATH 中）和 Python 3.8+（标准库，无需 pip 安装）。
-- Word 中的表格包裹公式会被 pandoc 转成 ASCII 虚线块，`fix_docx_equations.py` 自动修复为标准 `$$ ... \tag{N} $$` 格式。
-- 批注提取直接解析 docx XML，能区分已解决/未解决批注（pandoc 无法做到）。
-- 需要 `docx` skill 的 `scripts/office/unpack.py` 来解包 docx。
+- 依赖 **pandoc**（需在 PATH 中），Python 3.8+ 标准库即可，无需 pip 安装。
+- 自动修复 Word 公式转换问题，正确输出 `$$ ... \tag{N} $$` 格式。
+- 批注导出能区分已解决/未解决状态（pandoc 本身无法做到）。
